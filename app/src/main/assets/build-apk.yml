@@ -1,16 +1,22 @@
 name: Build APK
 
-# 由 Loom Build 自动生成。若项目自带构建流水线，可以保留本文件作为兜底。
+# 由 Loom Build 自动生成。首次构建会生成签名密钥并提交到 .loom/signing/，
+# 之后所有构建复用同一把密钥，保证升级覆盖安装不会签名冲突。
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip ci]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
@@ -25,7 +31,7 @@ jobs:
           java-version: '17'
 
       # 直接用 runner 预装的 SDK。刻意避开 android-actions/setup-android：
-      # 它内部会执行 `sdkmanager tools`，而该包已从 SDK 源中移除，会导致步骤直接失败。
+      # 它内部会执行 `sdkmanager tools`，该包已从 SDK 源移除，会让步骤直接失败。
       - name: Install Android SDK packages
         run: |
           set -euo pipefail
@@ -54,6 +60,48 @@ jobs:
           else
             gradle --no-daemon --stacktrace assembleDebug assembleRelease
           fi
+
+      - name: Sign release APK
+        run: |
+          set -euo pipefail
+          KS_DIR=.loom/signing
+          if [ ! -f "$KS_DIR/keystore.p12" ]; then
+            echo "第一次构建：生成签名密钥"
+            mkdir -p "$KS_DIR"
+            PASS=$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)
+            keytool -genkeypair -noprompt \
+              -keystore "$KS_DIR/keystore.p12" -storetype PKCS12 \
+              -alias loom -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$PASS" -keypass "$PASS" \
+              -dname "CN=Loom Build,O=Loom Build,C=CN"
+            printf 'storePassword=%s\nkeyPassword=%s\nalias=loom\n' "$PASS" "$PASS" > "$KS_DIR/signing.properties"
+            git config user.name "loom-build"
+            git config user.email "loom-build@users.noreply.github.com"
+            git add "$KS_DIR"
+            git commit -m "chore: add signing key [skip ci]"
+            git push
+          fi
+
+          set -a
+          . "$KS_DIR/signing.properties"
+          set +a
+
+          UNSIGNED=$(find . -path '*/build/outputs/apk/release/*.apk' -name '*unsigned*.apk' | head -1)
+          if [ -z "$UNSIGNED" ]; then
+            echo "没有未签名的 release 产物，跳过签名（项目可能已自带签名配置）"
+            exit 0
+          fi
+
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          echo "build-tools: $BT"
+          mkdir -p out
+          "$BT/zipalign" -p -f 4 "$UNSIGNED" out/app-release-signed.apk
+          "$BT/apksigner" sign \
+            --ks "$KS_DIR/keystore.p12" --ks-type PKCS12 \
+            --ks-key-alias "$alias" \
+            --ks-pass "pass:$storePassword" --key-pass "pass:$keyPassword" \
+            out/app-release-signed.apk
+          "$BT/apksigner" verify --print-certs out/app-release-signed.apk | head -4
 
       - name: Collect APKs
         run: |

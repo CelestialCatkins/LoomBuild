@@ -1,6 +1,8 @@
 package com.loom.build.feature
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -8,12 +10,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -21,6 +23,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.loom.build.data.ApkInstaller
 import com.loom.build.data.BuildStore
+import com.loom.build.data.HistoryItem
 import com.loom.build.ui.CardBox
 import com.loom.build.ui.Chip
 import com.loom.build.ui.DangerText
@@ -30,19 +33,24 @@ import com.loom.build.ui.Meter
 import com.loom.build.ui.Muted
 import com.loom.build.ui.OutlineButton
 import com.loom.build.ui.PageHeader
+import com.loom.build.ui.SectionHead
 import com.loom.build.ui.Tone
 import com.loom.build.ui.theme.LoomBuild
 import com.loom.build.ui.theme.Phase
 import com.loom.build.ui.theme.Sp
 import com.loom.build.ui.theme.Type
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 private data class Step(val label: String, val hint: String)
 
 private val STEPS = listOf(
-    Step("读取项目", "扫描文件并过滤构建产物"),
-    Step("上传到 GitHub", "并发写入仓库 blob"),
+    Step("读取项目", "扫描文件或读取远端仓库"),
+    Step("上传 / 触发", "写入 blob 或直接 dispatch"),
     Step("提交并注入流水线", "commit + build-apk.yml"),
-    Step("云端构建", "GitHub Actions 编译 APK"),
+    Step("云端构建", "GitHub Actions 编译并签名"),
     Step("取回产物", "下载 artifact 并校验"),
 )
 
@@ -100,11 +108,7 @@ fun BuildScreen(store: BuildStore, onOpenUrl: (String) -> Unit) {
                 Chip(text = "RUN", tone = Tone.Neutral)
             }
             Spacer(Modifier.weight(1f))
-            Text(
-                "${(store.progress * 100).toInt()}%",
-                style = Type.mono,
-                color = c.muted,
-            )
+            Text("${(store.progress * 100).toInt()}%", style = Type.mono, color = c.muted)
         }
 
         Spacer(Modifier.height(Sp.x6))
@@ -141,12 +145,33 @@ fun BuildScreen(store: BuildStore, onOpenUrl: (String) -> Unit) {
                 Spacer(Modifier.height(Sp.x2))
                 Text(store.apkLabel, style = Type.mono, color = c.accent)
                 Spacer(Modifier.height(Sp.x2))
-                Muted(BuildStore.formatSize(apk.length()) + " · 已通过 SHA-256 校验")
+                Muted(BuildStore.formatSize(apk.length()) + " · 由云端签名，可直接安装")
                 Spacer(Modifier.height(Sp.x4))
                 InkButton("安装 APK") { ApkInstaller.install(context, apk) }
             }
         } else {
             Muted("构建完成后，这里会出现安装按钮。")
+        }
+
+        if (store.history.isNotEmpty()) {
+            Spacer(Modifier.height(Sp.x7))
+            Hairline()
+            Spacer(Modifier.height(Sp.x5))
+            SectionHead("04", "构建历史")
+            Spacer(Modifier.height(Sp.x3))
+            CardBox {
+                val shown = store.history.take(10)
+                shown.forEachIndexed { index, item ->
+                    HistoryRow(
+                        item = item,
+                        onOpen = { url -> if (url.isNotBlank()) onOpenUrl(url) },
+                        onInstall = { file -> ApkInstaller.install(context, file) },
+                    )
+                    if (index != shown.lastIndex) Hairline()
+                }
+            }
+            Spacer(Modifier.height(Sp.x3))
+            OutlineButton("清空历史") { store.clearHistory() }
         }
 
         Spacer(Modifier.height(Sp.x8))
@@ -156,11 +181,6 @@ fun BuildScreen(store: BuildStore, onOpenUrl: (String) -> Unit) {
 @Composable
 private fun StepRow(index: Int, step: Step, state: Int) {
     val c = LoomBuild.colors
-    val tone: Color = when (state) {
-        1 -> c.ok
-        2 -> c.accent
-        else -> c.faint
-    }
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
         Text(
             index.toString().padStart(2, '0'),
@@ -193,3 +213,54 @@ private fun StepRow(index: Int, step: Step, state: Int) {
         }
     }
 }
+
+@Composable
+private fun HistoryRow(
+    item: HistoryItem,
+    onOpen: (String) -> Unit,
+    onInstall: (File) -> Unit,
+) {
+    val c = LoomBuild.colors
+    val fmt = remember { SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()) }
+    val ok = item.conclusion == "success"
+    val apk = item.apk
+    val file = if (apk.isNotBlank()) File(apk) else null
+    val canInstall = ok && file != null && file.exists()
+
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clickable { onOpen(item.url) }
+            .padding(vertical = Sp.x3),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                item.repo.ifBlank { "—" },
+                style = Type.mono,
+                color = c.ink,
+            )
+            Text(
+                "${fmt.format(Date(item.at))} · ${item.conclusion.ifBlank { "unknown" }}",
+                style = Type.micro,
+                color = c.faint,
+            )
+        }
+        if (canInstall && file != null) {
+            Box(
+                Modifier
+                    .clickable { onInstall(file) }
+                    .padding(horizontal = Sp.x3, vertical = Sp.x2),
+            ) {
+                Text("安装", style = Type.micro, color = c.accent)
+            }
+        }
+        Chip(
+            text = if (ok) "成功" else "失败",
+            tone = if (ok) Tone.Ok else Tone.Danger,
+        )
+    }
+}
+
+@Suppress("unused")
+private val unusedColor: Color? = null

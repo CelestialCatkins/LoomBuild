@@ -25,6 +25,21 @@ class Prefs(context: Context) {
         get() = sp.getString("folder", "").orEmpty()
         set(value) = sp.edit().putString("folder", value).apply()
 
+    /** 已有仓库模式的仓库全名（owner/name）。 */
+    var existingRepo: String
+        get() = sp.getString("existing", "").orEmpty()
+        set(value) = sp.edit().putString("existing", value).apply()
+
+    /** 0 = 本地项目，1 = 已有仓库。 */
+    var mode: Int
+        get() = sp.getInt("mode", 0)
+        set(value) = sp.edit().putInt("mode", value).apply()
+
+    /** 构建历史（JSON 数组字符串）。 */
+    var history: String
+        get() = sp.getString("history", "[]").orEmpty()
+        set(value) = sp.edit().putString("history", value).apply()
+
     fun clearAuth() {
         sp.edit().remove("token").remove("login").apply()
     }

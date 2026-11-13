@@ -16,8 +16,20 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.util.zip.ZipInputStream
+
+data class RepoRef(val fullName: String, val isPrivate: Boolean, val branch: String)
+
+data class HistoryItem(
+    val repo: String,
+    val url: String,
+    val conclusion: String,
+    val at: Long,
+    val apk: String,
+)
 
 /**
  * 应用的全部状态与流程编排。刻意不引入 ViewModel / DI，
@@ -35,7 +47,7 @@ class BuildStore(private val app: Context) {
 
     val bound: Boolean get() = token.isNotBlank()
 
-    // ---------- 项目 ----------
+    // ---------- 本地项目 ----------
     var folderUri by mutableStateOf(prefs.lastFolder)
         private set
     var folderName by mutableStateOf("")
@@ -54,6 +66,16 @@ class BuildStore(private val app: Context) {
     var gradleOk by mutableStateOf(false)
         private set
     var scanNote by mutableStateOf("")
+        private set
+
+    // ---------- 模式 0=本地项目 1=已有仓库 ----------
+    var mode by mutableStateOf(prefs.mode)
+        private set
+    var existingRepo by mutableStateOf(prefs.existingRepo)
+        private set
+    var repos by mutableStateOf<List<RepoRef>>(emptyList())
+        private set
+    var reposLoading by mutableStateOf(false)
         private set
 
     // ---------- 构建 ----------
@@ -76,6 +98,19 @@ class BuildStore(private val app: Context) {
     var busy by mutableStateOf(false)
         private set
 
+    // ---------- 历史 ----------
+    var history by mutableStateOf<List<HistoryItem>>(emptyList())
+        private set
+
+    init {
+        history = readHistory()
+    }
+
+    fun setMode(value: Int) {
+        mode = value
+        prefs.mode = value
+    }
+
     fun updateRepoName(value: String) {
         repoName = slug(value)
         prefs.repo = repoName
@@ -83,6 +118,16 @@ class BuildStore(private val app: Context) {
 
     fun setIsPrivate(value: Boolean) {
         isPrivate = value
+    }
+
+    fun setExistingRepo(value: String) {
+        existingRepo = value.trim()
+        prefs.existingRepo = existingRepo
+    }
+
+    fun clearHistory() {
+        history = emptyList()
+        prefs.history = "[]"
     }
 
     // ---------- 绑定 ----------
@@ -114,6 +159,7 @@ class BuildStore(private val app: Context) {
         prefs.clearAuth()
         token = ""
         login = ""
+        repos = emptyList()
         reset()
     }
 
@@ -126,7 +172,7 @@ class BuildStore(private val app: Context) {
                 android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
             )
         } catch (e: Exception) {
-            // 某些文件管理器不授予持久权限，仅本次可用；扫描仍可进行。
+            // 某些文件管理器不授予持久权限，仅本次可用。
         }
         folderUri = uri.toString()
         prefs.lastFolder = folderUri
@@ -170,7 +216,107 @@ class BuildStore(private val app: Context) {
         }
     }
 
-    // ---------- 上传 + 构建 ----------
+    // ---------- 已有仓库 ----------
+
+    suspend fun loadRepos() {
+        if (token.isBlank()) {
+            error = "请先绑定 GitHub"
+            return
+        }
+        reposLoading = true
+        error = ""
+        try {
+            val arr = withContext(Dispatchers.IO) { GitHub(token).myRepos() }
+            val out = ArrayList<RepoRef>()
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                out.add(
+                    RepoRef(
+                        fullName = o.optString("full_name"),
+                        isPrivate = o.optBoolean("private"),
+                        branch = o.optString("default_branch", "main").ifBlank { "main" },
+                    ),
+                )
+            }
+            repos = out
+        } catch (e: Exception) {
+            error = e.message ?: "读取仓库列表失败"
+        } finally {
+            reposLoading = false
+        }
+    }
+
+    suspend fun startExisting() {
+        if (busy) return
+        val full = existingRepo.trim()
+        if (token.isBlank()) {
+            error = "请先在设置里绑定 GitHub"
+            return
+        }
+        val owner = full.substringBefore("/", "")
+        val name = full.substringAfter("/", "")
+        if (owner.isBlank() || name.isBlank() || !full.contains("/")) {
+            error = "仓库格式应为 owner/name"
+            return
+        }
+
+        busy = true
+        error = ""
+        apkFile = null
+        apkLabel = ""
+        runUrl = ""
+        progress = 0f
+
+        try {
+            val gh = GitHub(token)
+
+            phase = Phase.SCANNING
+            headline = "读取仓库"
+            detail = full
+            val info = withContext(Dispatchers.IO) { gh.repo(owner, name) }
+                ?: throw IllegalStateException("找不到仓库 $full")
+
+            val branch = info.optString("default_branch", "main").ifBlank { "main" }
+
+            phase = Phase.COMMITTING
+            headline = "准备流水线"
+            detail = GitHub.WORKFLOW_PATH
+            val existingSha = withContext(Dispatchers.IO) {
+                gh.contentSha(owner, name, GitHub.WORKFLOW_PATH, branch)
+            }
+            if (existingSha == null) {
+                val yml = WorkflowTemplate.load(app)
+                withContext(Dispatchers.IO) {
+                    gh.putContent(
+                        owner,
+                        name,
+                        GitHub.WORKFLOW_PATH,
+                        Base64.encodeToString(yml.toByteArray(), Base64.NO_WRAP),
+                        "Loom Build：注入构建流水线",
+                        branch,
+                        null,
+                    )
+                }
+            }
+
+            phase = Phase.QUEUED
+            headline = "触发云端构建"
+            val before = latestRunId(gh, owner, name, branch)
+            dispatchWithRetry(gh, owner, name, branch)
+            val runId = waitForRun(gh, owner, name, branch, before, null)
+            val conclusion = followRun(gh, owner, name, runId)
+            finish(gh, owner, name, runId, conclusion)
+        } catch (e: Exception) {
+            phase = Phase.ERROR
+            if (headline.isBlank() || headline == "尚未开始") headline = "出错"
+            error = e.message ?: e.toString()
+            if (full.contains("/")) record(full, runUrl, "failure")
+        } finally {
+            busy = false
+        }
+    }
+
+    // ---------- 本地项目上传 + 构建 ----------
 
     suspend fun start() {
         if (busy) return
@@ -194,12 +340,16 @@ class BuildStore(private val app: Context) {
         runUrl = ""
         progress = 0f
 
+        var owner = login
+        var full = ""
+
         try {
-            val owner = if (login.isNotBlank()) login else withContext(Dispatchers.IO) {
+            owner = if (login.isNotBlank()) login else withContext(Dispatchers.IO) {
                 GitHub(token).user().optString("login")
             }
             login = owner
             prefs.login = owner
+            full = "$owner/$repoName"
 
             phase = Phase.SCANNING
             headline = "读取项目"
@@ -217,7 +367,7 @@ class BuildStore(private val app: Context) {
 
             phase = Phase.UPLOADING
             headline = "准备仓库"
-            detail = "$owner/$repoName"
+            detail = full
             val exists = withContext(Dispatchers.IO) { gh.repo(owner, repoName) }
             if (exists == null) {
                 withContext(Dispatchers.IO) {
@@ -306,116 +456,197 @@ class BuildStore(private val app: Context) {
             phase = Phase.QUEUED
             headline = "触发云端构建"
             detail = commitSha.take(7)
-            withContext(Dispatchers.IO) {
-                // workflow 文件刚提交时可能尚未被索引，404 属于正常，稍后由 push 触发兜底。
-                repeat(3) {
-                    try {
-                        gh.dispatch(owner, repoName, branch)
-                        return@withContext
-                    } catch (e: GitHubException) {
-                        if (e.status != 404) throw e
-                    }
-                    Thread.sleep(2500)
-                }
-            }
-
-            // 等待 run 出现
-            val findDeadline = System.currentTimeMillis() + 120_000
-            var runId = 0L
-            while (runId == 0L && System.currentTimeMillis() < findDeadline) {
-                val arr = withContext(Dispatchers.IO) {
-                    gh.runs(owner, repoName, branch).optJSONArray("workflow_runs")
-                }
-                if (arr != null) {
-                    for (i in 0 until arr.length()) {
-                        val r = arr.getJSONObject(i)
-                        if (r.optString("head_sha") == commitSha) {
-                            runId = r.optLong("id")
-                            runUrl = r.optString("html_url")
-                            break
-                        }
-                    }
-                }
-                if (runId == 0L) delay(4000)
-            }
-            if (runId == 0L) throw IllegalStateException("没有找到对应的 Actions 运行，请到仓库确认 Actions 是否开启")
-
-            phase = Phase.RUNNING
-            headline = "云端构建中"
-            val runDeadline = System.currentTimeMillis() + 30 * 60 * 1000
-            var conclusion = ""
-            while (true) {
-                val run = withContext(Dispatchers.IO) { gh.run(owner, repoName, runId) }
-                val status = run.optString("status")
-                conclusion = run.optString("conclusion")
-                detail = when (status) {
-                    "queued" -> "排队中"
-                    "in_progress" -> "编译中"
-                    "completed" -> "已结束"
-                    else -> status
-                }
-                runUrl = run.optString("html_url", runUrl)
-                if (status == "completed") break
-                if (System.currentTimeMillis() > runDeadline) {
-                    throw IllegalStateException("构建超时（30 分钟）")
-                }
-                delay(5000)
-            }
-
-            if (conclusion != "success") {
-                phase = Phase.ERROR
-                headline = "构建失败"
-                detail = "结论：$conclusion"
-                error = "打开构建日志查看原因（右上角可跳转）"
-                return
-            }
-
-            phase = Phase.DOWNLOADING
-            headline = "下载产物"
-            detail = ""
-
-            val arts = withContext(Dispatchers.IO) {
-                gh.artifacts(owner, repoName, runId).optJSONArray("artifacts")
-            }
-            var artifactId = 0L
-            var artifactName = ""
-            if (arts != null) {
-                for (i in 0 until arts.length()) {
-                    val a = arts.getJSONObject(i)
-                    if (a.optLong("size_in_bytes") > 0) {
-                        artifactId = a.optLong("id")
-                        artifactName = a.optString("name")
-                        break
-                    }
-                }
-            }
-            if (artifactId == 0L) throw IllegalStateException("这次运行没有产物，检查是否真的产出了 APK")
-
-            val outDir = File(app.cacheDir, "apk").apply {
-                deleteRecursively()
-                mkdirs()
-            }
-            val zip = File(outDir, "$artifactName.zip")
-            withContext(Dispatchers.IO) { gh.downloadArtifact(owner, repoName, artifactId, zip) }
-
-            val apk = withContext(Dispatchers.IO) { extractApk(zip, outDir) }
-                ?: throw IllegalStateException("产物里没有 .apk 文件")
-            zip.delete()
-
-            apkFile = apk
-            apkLabel = apk.name
-            phase = Phase.DONE
-            headline = "构建完成"
-            detail = "${apk.name} · ${formatSize(apk.length())}"
-            progress = 1f
+            val before = latestRunId(gh, owner, repoName, branch)
+            dispatchWithRetry(gh, owner, repoName, branch)
+            val runId = waitForRun(gh, owner, repoName, branch, before, commitSha)
+            val conclusion = followRun(gh, owner, repoName, runId)
+            finish(gh, owner, repoName, runId, conclusion)
         } catch (e: Exception) {
             phase = Phase.ERROR
-            if (headline == "尚未开始" || headline == "") headline = "出错"
+            if (headline.isBlank() || headline == "尚未开始") headline = "出错"
             error = e.message ?: e.toString()
+            if (full.isNotBlank()) record(full, runUrl, "failure")
         } finally {
             busy = false
         }
     }
+
+    // ---------- 共用流程 ----------
+
+    private suspend fun latestRunId(gh: GitHub, owner: String, name: String, branch: String): Long {
+        val arr = withContext(Dispatchers.IO) {
+            gh.runs(owner, name, branch).optJSONArray("workflow_runs")
+        }
+        if (arr == null || arr.length() == 0) return 0L
+        return arr.getJSONObject(0).optLong("id")
+    }
+
+    private suspend fun dispatchWithRetry(gh: GitHub, owner: String, name: String, branch: String) {
+        withContext(Dispatchers.IO) {
+            repeat(4) {
+                try {
+                    gh.dispatch(owner, name, branch)
+                    return@withContext
+                } catch (e: GitHubException) {
+                    if (e.status != 404) throw e
+                }
+                Thread.sleep(3000)
+            }
+        }
+    }
+
+    private suspend fun waitForRun(
+        gh: GitHub,
+        owner: String,
+        name: String,
+        branch: String,
+        sinceId: Long,
+        headSha: String?,
+    ): Long {
+        val deadline = System.currentTimeMillis() + 180_000
+        while (System.currentTimeMillis() < deadline) {
+            val arr = withContext(Dispatchers.IO) {
+                gh.runs(owner, name, branch).optJSONArray("workflow_runs")
+            }
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val r = arr.getJSONObject(i)
+                    val id = r.optLong("id")
+                    if (id <= sinceId) break
+                    if (headSha == null || r.optString("head_sha") == headSha) {
+                        runUrl = r.optString("html_url")
+                        return id
+                    }
+                }
+            }
+            delay(4000)
+        }
+        throw IllegalStateException("没有找到对应的 Actions 运行，请确认仓库已启用 Actions")
+    }
+
+    private suspend fun followRun(gh: GitHub, owner: String, name: String, runId: Long): String {
+        phase = Phase.RUNNING
+        headline = "云端构建中"
+        val deadline = System.currentTimeMillis() + 30 * 60 * 1000
+        while (true) {
+            val run = withContext(Dispatchers.IO) { gh.run(owner, name, runId) }
+            val status = run.optString("status")
+            val conclusion = run.optString("conclusion")
+            detail = when (status) {
+                "queued" -> "排队中"
+                "in_progress" -> "编译中"
+                "completed" -> "已结束"
+                else -> status
+            }
+            runUrl = run.optString("html_url", runUrl)
+            progress = when (status) {
+                "queued" -> 0.35f
+                "in_progress" -> 0.6f
+                else -> 0.85f
+            }
+            if (status == "completed") return conclusion
+            if (System.currentTimeMillis() > deadline) {
+                throw IllegalStateException("构建超时（30 分钟）")
+            }
+            delay(5000)
+        }
+    }
+
+    private suspend fun finish(gh: GitHub, owner: String, name: String, runId: Long, conclusion: String) {
+        if (conclusion != "success") {
+            phase = Phase.ERROR
+            headline = "构建失败"
+            detail = "结论：$conclusion"
+            error = "打开云端日志查看原因"
+            record("$owner/$name", runUrl, conclusion)
+            return
+        }
+
+        phase = Phase.DOWNLOADING
+        headline = "下载产物"
+        detail = ""
+
+        val arts = withContext(Dispatchers.IO) {
+            gh.artifacts(owner, name, runId).optJSONArray("artifacts")
+        }
+        var artifactId = 0L
+        var artifactName = ""
+        if (arts != null) {
+            for (i in 0 until arts.length()) {
+                val a = arts.getJSONObject(i)
+                if (a.optLong("size_in_bytes") > 0) {
+                    artifactId = a.optLong("id")
+                    artifactName = a.optString("name")
+                    break
+                }
+            }
+        }
+        if (artifactId == 0L) throw IllegalStateException("这次运行没有产物，检查是否真的产出了 APK")
+
+        val outDir = File(app.cacheDir, "apk").apply {
+            deleteRecursively()
+            mkdirs()
+        }
+        val zip = File(outDir, "$artifactName.zip")
+        withContext(Dispatchers.IO) { gh.downloadArtifact(owner, name, artifactId, zip) }
+
+        val apk = withContext(Dispatchers.IO) { extractApk(zip, outDir) }
+            ?: throw IllegalStateException("产物里没有 .apk 文件")
+        zip.delete()
+
+        apkFile = apk
+        apkLabel = apk.name
+        phase = Phase.DONE
+        headline = "构建完成"
+        detail = "${apk.name} · ${formatSize(apk.length())}"
+        progress = 1f
+        record("$owner/$name", runUrl, "success", apk.absolutePath)
+    }
+
+    // ---------- 历史 ----------
+
+    private fun readHistory(): List<HistoryItem> {
+        val raw = prefs.history
+        return try {
+            val arr = JSONArray(raw)
+            val out = ArrayList<HistoryItem>()
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                out.add(
+                    HistoryItem(
+                        repo = o.optString("repo"),
+                        url = o.optString("url"),
+                        conclusion = o.optString("conclusion"),
+                        at = o.optLong("at"),
+                        apk = o.optString("apk"),
+                    ),
+                )
+            }
+            out
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun record(repo: String, url: String, conclusion: String, apkPath: String = "") {
+        if (repo.isBlank()) return
+        val item = HistoryItem(repo, url, conclusion, System.currentTimeMillis(), apkPath)
+        history = (listOf(item) + history).take(30)
+        val arr = JSONArray()
+        for (h in history) {
+            arr.put(
+                JSONObject()
+                    .put("repo", h.repo)
+                    .put("url", h.url)
+                    .put("conclusion", h.conclusion)
+                    .put("at", h.at)
+                    .put("apk", h.apk),
+            )
+        }
+        prefs.history = arr.toString()
+    }
+
+    // ---------- 其它 ----------
 
     fun reset() {
         phase = Phase.IDLE
@@ -431,9 +662,8 @@ class BuildStore(private val app: Context) {
         apkLabel = ""
     }
 
-    // ---------- 工具 ----------
-
     private fun extractApk(zip: File, outDir: File): File? {
+        var signed: File? = null
         var debug: File? = null
         var biggest: File? = null
         ZipInputStream(zip.inputStream().buffered()).use { zis ->
@@ -442,14 +672,16 @@ class BuildStore(private val app: Context) {
                 if (!entry.isDirectory && entry.name.endsWith(".apk", ignoreCase = true)) {
                     val safe = File(outDir, File(entry.name).name)
                     safe.outputStream().use { out -> zis.copyTo(out) }
-                    if (safe.name.contains("debug", ignoreCase = true)) debug = safe
+                    val n = safe.name.lowercase()
+                    if (n.contains("signed")) signed = safe
+                    if (n.contains("debug")) debug = safe
                     if (biggest == null || safe.length() > biggest!!.length()) biggest = safe
                 }
                 zis.closeEntry()
                 entry = zis.nextEntry
             }
         }
-        return debug ?: biggest
+        return signed ?: debug ?: biggest
     }
 
     companion object {

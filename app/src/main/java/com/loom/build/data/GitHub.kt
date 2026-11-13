@@ -182,6 +182,35 @@ class GitHub(private val token: String) {
     fun artifacts(owner: String, name: String, runId: Long): JSONObject =
         JSONObject(call("GET", "/repos/$owner/$name/actions/runs/$runId/artifacts"))
 
+    fun myRepos(): JSONArray =
+        JSONArray(call("GET", "/user/repos?per_page=100&sort=updated&affiliation=owner"))
+
+    /** 文件存在则返回其 blob sha，否则 null。 */
+    fun contentSha(owner: String, name: String, path: String, branch: String): String? = try {
+        JSONObject(call("GET", "/repos/$owner/$name/contents/$path?ref=$branch"))
+            .optString("sha")
+            .takeIf { it.isNotBlank() }
+    } catch (e: GitHubException) {
+        if (e.status == 404) null else throw e
+    }
+
+    fun putContent(
+        owner: String,
+        name: String,
+        path: String,
+        base64: String,
+        message: String,
+        branch: String,
+        sha: String?,
+    ) {
+        val body = JSONObject()
+            .put("message", message)
+            .put("content", base64)
+            .put("branch", branch)
+        if (sha != null) body.put("sha", sha)
+        call("PUT", "/repos/$owner/$name/contents/$path", body)
+    }
+
     fun downloadArtifact(owner: String, name: String, artifactId: Long, dest: File) {
         val req = Request.Builder()
             .url("$API/repos/$owner/$name/actions/artifacts/$artifactId/zip")

@@ -54,3 +54,25 @@ gradle :app:assembleDebug
 ```
 
 或直接推到 `main`，由本仓库的 Actions 产出 APK。
+
+## v1.1.0 新增
+
+### 1. 自动签名
+
+第一次构建时，流水线会用 `keytool` 生成一把 2048 位 RSA 密钥，写入仓库的 `.loom/signing/`，然后提交（`[skip ci]`，不会触发循环构建）。之后每次构建都用 `zipalign` + `apksigner` 签同一个包，**升级覆盖安装不会签名冲突**。
+
+> 权衡：密钥材料存放在仓库里（不是 GitHub Secrets）。GitHub Secrets API 要求用 libsodium sealed box 加密，那意味着要给 App 打包一整套原生加密库；对私人仓库而言，把密钥随仓库保存是更简单可靠的做法。仓库若不是私有，请不要用它签名发布。
+
+### 2. 直接构建已有仓库
+
+项目页顶部可切换到「已有仓库」：填 `owner/name`，或点「载入我的仓库」从列表里选。App 会：
+
+1. 检查 `.github/workflows/build-apk.yml`，没有就注入；
+2. 对默认分支发 `workflow_dispatch`；
+3. 等待运行、下载产物。
+
+本地文件不会被上传。
+
+### 3. 构建历史
+
+最近 30 次构建记录持久化在本地：仓库、时间、成败、以及该次 APK 的路径。构建页底部可回看，成功且文件还在时可直接「安装」，点整行则跳转云端日志。
