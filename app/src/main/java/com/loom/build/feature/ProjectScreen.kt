@@ -91,8 +91,8 @@ fun ProjectScreen(store: BuildStore, onStarted: () -> Unit) {
                 },
                 enabled = store.gradleOk && !store.busy && store.repoName.isNotBlank(),
             ) {
+                store.startBuild()
                 onStarted()
-                scope.launch { store.start() }
             }
             Spacer(Modifier.height(Sp.x3))
             Muted("提交到 ${store.login.ifBlank { "你的账号" }}/${store.repoName.ifBlank { "仓库" }}，并自动注入构建流水线。")
@@ -101,8 +101,8 @@ fun ProjectScreen(store: BuildStore, onStarted: () -> Unit) {
                 text = if (store.busy) "处理中…" else "构建这个仓库",
                 enabled = store.existingRepo.contains("/") && !store.busy,
             ) {
+                store.startExistingBuild()
                 onStarted()
-                scope.launch { store.startExisting() }
             }
             Spacer(Modifier.height(Sp.x3))
             Muted("只触发云端构建，不会上传任何本地文件。首次会为该仓库注入 build-apk.yml。")

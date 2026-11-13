@@ -8,11 +8,14 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.documentfile.provider.DocumentFile
 import com.loom.build.ui.theme.Phase
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
@@ -38,6 +41,13 @@ data class HistoryItem(
 class BuildStore(private val app: Context) {
 
     private val prefs = Prefs(app)
+
+    /**
+     * 构建必须活过界面的组合：点「上传并构建」会立刻切到构建页签，
+     * 若用 rememberCoroutineScope，切换时作用域被取消，会抛
+     * "The coroutine scope left the composition"。界面只观察，构建跑在这里。
+     */
+    private val work = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     // ---------- 账号 ----------
     var token by mutableStateOf(prefs.token)
@@ -128,6 +138,15 @@ class BuildStore(private val app: Context) {
     fun clearHistory() {
         history = emptyList()
         prefs.history = "[]"
+    }
+
+    /** 界面调用：立刻返回，构建在 store 自己的作用域里跑，切页签也不会中断。 */
+    fun startBuild() {
+        work.launch { start() }
+    }
+
+    fun startExistingBuild() {
+        work.launch { startExisting() }
     }
 
     // ---------- 绑定 ----------
