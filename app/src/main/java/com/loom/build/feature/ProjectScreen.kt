@@ -66,7 +66,7 @@ fun ProjectScreen(store: BuildStore, onStarted: () -> Unit) {
         )
         Spacer(Modifier.height(Sp.x5))
 
-        ModeSwitch(store.mode) { store.setMode(it) }
+        ModeSwitch(store.mode) { store.selectMode(it) }
         Spacer(Modifier.height(Sp.x6))
 
         if (store.mode == 0) {
@@ -209,7 +209,7 @@ private fun ExistingSection(store: BuildStore) {
     Field(
         label = "仓库",
         value = store.existingRepo,
-        onValueChange = { store.setExistingRepo(it) },
+        onValueChange = { store.updateExistingRepo(it) },
         placeholder = "owner/name",
         mono = true,
     )
@@ -233,7 +233,7 @@ private fun ExistingSection(store: BuildStore) {
             val shown = store.repos.take(12)
             shown.forEachIndexed { index, repo ->
                 RepoRow(repo, selected = store.existingRepo == repo.fullName) {
-                    store.setExistingRepo(repo.fullName)
+                    store.updateExistingRepo(repo.fullName)
                 }
                 if (index != shown.lastIndex) Hairline()
             }

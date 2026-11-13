@@ -106,7 +106,7 @@ class BuildStore(private val app: Context) {
         history = readHistory()
     }
 
-    fun setMode(value: Int) {
+    fun selectMode(value: Int) {
         mode = value
         prefs.mode = value
     }
@@ -120,7 +120,7 @@ class BuildStore(private val app: Context) {
         isPrivate = value
     }
 
-    fun setExistingRepo(value: String) {
+    fun updateExistingRepo(value: String) {
         existingRepo = value.trim()
         prefs.existingRepo = existingRepo
     }
