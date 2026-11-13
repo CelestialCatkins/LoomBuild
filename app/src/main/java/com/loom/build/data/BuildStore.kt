@@ -76,7 +76,7 @@ class BuildStore(private val app: Context) {
     var busy by mutableStateOf(false)
         private set
 
-    fun setRepoName(value: String) {
+    fun updateRepoName(value: String) {
         repoName = slug(value)
         prefs.repo = repoName
     }
@@ -102,7 +102,7 @@ class BuildStore(private val app: Context) {
             login = name
             prefs.token = candidate
             prefs.login = name
-            if (repoName.isBlank()) setRepoName("$name-app")
+            if (repoName.isBlank()) updateRepoName("$name-app")
         } catch (e: Exception) {
             error = e.message ?: "绑定失败"
         } finally {
@@ -131,7 +131,7 @@ class BuildStore(private val app: Context) {
         folderUri = uri.toString()
         prefs.lastFolder = folderUri
         folderName = DocumentFile.fromTreeUri(app, uri)?.name ?: "已选目录"
-        if (repoName.isBlank()) setRepoName(folderName)
+        if (repoName.isBlank()) updateRepoName(folderName)
         rescan()
     }
 

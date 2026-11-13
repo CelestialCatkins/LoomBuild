@@ -89,7 +89,7 @@ fun ProjectScreen(store: BuildStore, onStarted: () -> Unit) {
         Field(
             label = "仓库名",
             value = store.repoName,
-            onValueChange = { store.setRepoName(it) },
+            onValueChange = { store.updateRepoName(it) },
             placeholder = "例如 my-loom-app",
             mono = true,
         )
